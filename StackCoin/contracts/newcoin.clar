@@ -2,7 +2,7 @@
 (define-fungible-token stablecoin)
 
 ;; Governance: contract owner
-(define-constant contract-owner 'ST1G7HBCZZ6S3G3F9H5XW0A6MS7K139JNSN9GJY9)
+(define-constant contract-owner 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM)
 
 ;; Variables for exchange rate and collateral
 (define-data-var exchange-rate uint u1000) ;; 1 stablecoin = 1 USD
@@ -20,19 +20,22 @@
 (define-public (update-exchange-rate (new-rate uint))
   (begin
     (asserts! (is-eq tx-sender contract-owner) (err u403))
-    (var-set exchange-rate new-rate)))
+    (asserts! (> new-rate u0) (err u400))
+    (ok (var-set exchange-rate new-rate))))
 
 ;; Collateral management: deposit, withdrawal, and interest distribution
 (define-public (deposit-collateral (usd-deposited uint))
   (begin
-    (stx-transfer? usd-deposited tx-sender contract-owner)
+    (asserts! (> usd-deposited u0) (err u400))
+    (try! (stx-transfer? usd-deposited tx-sender contract-owner))
     (var-set total-collateral (+ (var-get total-collateral) usd-deposited))
     (ok usd-deposited)))
 
 (define-public (withdraw-collateral (usd-withdrawn uint))
   (begin
+    (asserts! (> usd-withdrawn u0) (err u400))
     (asserts! (>= (var-get total-collateral) usd-withdrawn) (err u401))
-    (stx-transfer? usd-withdrawn contract-owner tx-sender)
+    (try! (stx-transfer? usd-withdrawn contract-owner tx-sender))
     (var-set total-collateral (- (var-get total-collateral) usd-withdrawn))
     (ok usd-withdrawn)))
 
@@ -40,55 +43,67 @@
   (begin
     (let ((current-collateral (var-get total-collateral))
           (rate (var-get interest-rate)))
-      (let ((interest (divide (multiply current-collateral rate) u100))) ;; calculate yearly interest
+      (let ((interest (/ (* current-collateral rate) u100))) ;; calculate yearly interest
         (var-set total-collateral (+ current-collateral interest)) ;; add interest to total collateral
         (ok interest)))))
 
 ;; Minting and burning stablecoins with stability fee
 (define-public (mint-stablecoins (usd-deposited uint))
-  (let ((fee (divide (multiply usd-deposited (var-get stability-fee)) u1000))
-        (tokens-to-mint (divide (- usd-deposited fee) (var-get exchange-rate))))
-    (stx-transfer? fee tx-sender contract-owner) ;; Fee transferred to a governance or reserve fund
-    (mint! stablecoin tokens-to-mint tx-sender)))
+  (let ((fee (/ (* usd-deposited (var-get stability-fee)) u1000))
+        (tokens-to-mint (/ (- usd-deposited fee) (var-get exchange-rate))))
+    (begin
+      (asserts! (> usd-deposited u0) (err u400))
+      (asserts! (> tokens-to-mint u0) (err u400))
+      (try! (stx-transfer? usd-deposited tx-sender contract-owner))
+      (try! (stx-transfer? fee contract-owner (as-contract tx-sender))) ;; Fee transferred to a governance or reserve fund
+      (ft-mint? stablecoin tokens-to-mint tx-sender))))
 
 (define-public (burn-stablecoins (tokens-to-burn uint))
-  (let ((usd-returned (multiply tokens-to-burn (var-get exchange-rate)))
-        (fee (divide (multiply usd-returned (var-get stability-fee)) u1000)))
-    (asserts! (>= (var-get total-collateral) (+ usd-returned fee)) (err u401))
-    (stx-transfer? (- usd-returned fee) contract-owner tx-sender) ;; Return USD minus the fee
-    (burn! stablecoin tokens-to-burn tx-sender)))
+  (let ((usd-returned (* tokens-to-burn (var-get exchange-rate)))
+        (fee (/ (* usd-returned (var-get stability-fee)) u1000)))
+    (begin
+      (asserts! (> tokens-to-burn u0) (err u400))
+      (asserts! (>= (var-get total-collateral) (+ usd-returned fee)) (err u401))
+      (try! (ft-burn? stablecoin tokens-to-burn tx-sender))
+      (try! (stx-transfer? (- usd-returned fee) contract-owner tx-sender)) ;; Return USD minus the fee
+      (ok true))))
 
 ;; Governance: proposal creation and voting
 (define-public (create-proposal (description (string-utf8 256)))
   (let ((proposal-id (var-get next-proposal-id)))
+    (asserts! (> (len description) u0) (err u400))
     (map-insert proposals {proposal-id: proposal-id}
       {proposer: tx-sender, description: description, votes-for: u0, votes-against: u0, active: true})
     (var-set next-proposal-id (+ proposal-id u1))
     (ok proposal-id)))
 
 (define-public (vote-on-proposal (proposal-id uint) (support bool))
-  (match (map-get? proposals {proposal-id: proposal-id})
-    proposal 
-    (begin
-      (asserts! (get active proposal) (err u505))
-      (let ((new-votes-for (if support (+ (get votes-for proposal) u1) (get votes-for proposal)))
-            (new-votes-against (if support (get votes-against proposal) (+ (get votes-against proposal) u1))))
-        (map-set proposals {proposal-id: proposal-id}
-          {proposer: (get proposer proposal), description: (get description proposal), votes-for: new-votes-for, votes-against: new-votes-against, active: (get active proposal)})
-        (ok (tuple (for new-votes-for) (against new-votes-against)))))
-    (err u404)))
+  (begin
+    (asserts! (< proposal-id (var-get next-proposal-id)) (err u404))
+    (match (map-get? proposals {proposal-id: proposal-id})
+      proposal 
+      (begin
+        (asserts! (get active proposal) (err u505))
+        (let ((new-votes-for (if support (+ (get votes-for proposal) u1) (get votes-for proposal)))
+              (new-votes-against (if support (get votes-against proposal) (+ (get votes-against proposal) u1))))
+          (map-set proposals {proposal-id: proposal-id}
+            {proposer: (get proposer proposal), description: (get description proposal), votes-for: new-votes-for, votes-against: new-votes-against, active: (get active proposal)})
+          (ok {for: new-votes-for, against: new-votes-against})))
+      (err u404))))
 
 (define-public (finalize-vote (proposal-id uint))
-  (match (map-get? proposals {proposal-id: proposal-id})
-    proposal 
-    (begin
-      (asserts! (get active proposal) (err u505))
-      (if (>= (get votes-for proposal) (get votes-against proposal))
-        (begin
-          ;; Execution logic based on proposal type or content
-          (ok "Proposal Approved and Executed"))
-        (ok "Proposal Rejected")))
-    (err u404)))
+  (begin
+    (asserts! (< proposal-id (var-get next-proposal-id)) (err u404))
+    (match (map-get? proposals {proposal-id: proposal-id})
+      proposal 
+      (begin
+        (asserts! (get active proposal) (err u505))
+        (if (>= (get votes-for proposal) (get votes-against proposal))
+          (begin
+            ;; Execution logic based on proposal type or content
+            (ok "Proposal Approved and Executed"))
+          (ok "Proposal Rejected")))
+      (err u404))))
 
 ;; Read-only functions to get current values
 (define-read-only (get-exchange-rate)
