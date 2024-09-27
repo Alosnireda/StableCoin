@@ -1,0 +1,1 @@
+Stable Coin Smart Contract
